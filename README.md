@@ -63,4 +63,4 @@ Model şu iki hatayı aynı anda minimize etmeye çalışır:
 *   `ozel_sonuc_*.png`: Sizin dosyalarınızla yapılan testlerin sonuçları.
 
 ---
-*Bu proje DeepMind Assistant tarafından hazırlanmıştır.*
+
