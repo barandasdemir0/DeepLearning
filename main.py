@@ -1,374 +1,365 @@
-import tensorflow as tf
-from tensorflow.keras import layers, models, backend as K
+"""
+Deep Steganography Project
+==========================
+Bu modül, Derin Öğrenme (Deep Learning) kullanarak bir görüntüyü başka bir görüntünün içine
+piksel seviyesinde gizleyen ve geri çıkaran profesyonel bir uygulama sunar.
+
+Mimari:
+    - Prep Network: Gizli veriyi hazırlar.
+    - Hiding Network (Encoder): Veriyi kapak resmine gizler.
+    - Reveal Network (Decoder): Gizli veriyi geri çıkarır.
+
+Yazar: DeepMind Assistant
+Tarih: 2025
+"""
+
+import os
+import glob
+from typing import Tuple, List, Optional, Union
+
 import numpy as np
 import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
 import requests
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
-import os
 
 # ==========================================
-# AYARLAR (KONFIGURASYON)
+# KONFİGÜRASYON (CONFIGURATION)
 # ==========================================
-IMG_SIZE = (128, 128)  # Eğitim hızı için 128x128 ideal
-EPOCHS = 100           # Eğitim döngüsü sayısı (Daha iyi sonuç için artırılabilir)
-BATCH_SIZE = 8         # Her adımda işlenen resim sayısı
-BETA = 1.0             # Gizli resim hatasının ağırlığı (1.0 = eşit önem)
-
-print("Program başlatılıyor...")
-print(f"TensorFlow Versiyonu: {tf.__version__}")
-
-# ==========================================
-# 1. VERİ HAZIRLAMA (GÜNCELLENDİ)
-# ==========================================
-def download_and_save_images(folder_name="resimler"):
-    """
-    İnternetten güzel manzara/tablo resimleri indirip klasöre kaydeder.
-    Eğer klasörde zaten resim varsa indirme yapmaz, onları kullanır.
-    """
-    if not os.path.exists(folder_name):
-        os.makedirs(folder_name)
-        print(f"'{folder_name}' klasörü oluşturuldu.")
+class Config:
+    """Proje genelindeki sabitler ve ayarlar."""
+    IMG_SIZE = (128, 128)
+    CHANNELS = 3
+    BATCH_SIZE = 8
+    EPOCHS = 100
+    LEARNING_RATE = 0.001
     
-    # Klasördeki mevcut resimleri kontrol et
-    existing_files = [f for f in os.listdir(folder_name) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    # Loss Ağırlıkları (GÜNCELLENDİ: Denge Ayarı)
+    # Beta: Gizli resim kalitesi için artırıldı (Geri çıkarılan daha net olacak)
+    # Alpha: Kapak koruması biraz gevşetildi (Çok hafif ghosting olabilir)
+    LOSS_ALPHA = 5.0  
+    LOSS_BETA = 1.5   
     
-    if len(existing_files) >= 2:
-        print(f"'{folder_name}' klasöründe {len(existing_files)} resim bulundu. Bunlar kullanılacak.")
-        return
-
-    print("Klasör boş veya yetersiz. İnternetten örnek resimler indiriliyor...")
-    
-    # Daha güvenilir ve güzel resim kaynakları (Manzara, Tablo vb.)
-    urls = [
-        ("manzara.jpg", "https://images.unsplash.com/photo-1472214103451-9374bd1c798e?q=80&w=400&auto=format&fit=crop"), # Doğa
-        ("tablo.jpg", "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/402px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg"), # Mona Lisa
-        ("sehir.jpg", "https://images.unsplash.com/photo-1519501025264-65ba15a82390?q=80&w=400&auto=format&fit=crop"), # Şehir
-        ("kedi.jpg", "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?q=80&w=400&auto=format&fit=crop")  # Kedi
+    DATA_DIR = "resimler"
+    DEFAULT_URLS = [
+        ("manzara.jpg", "https://images.unsplash.com/photo-1472214103451-9374bd1c798e?q=80&w=400&auto=format&fit=crop"),
+        ("tablo.jpg", "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/402px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg"),
+        ("sehir.jpg", "https://images.unsplash.com/photo-1519501025264-65ba15a82390?q=80&w=400&auto=format&fit=crop"),
+        ("kedi.jpg", "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?q=80&w=400&auto=format&fit=crop")
     ]
-    
-    headers = {'User-Agent': 'Mozilla/5.0'} # Bazı siteler botları engeller, tarayıcı gibi görünelim
-    
-    for filename, url in urls:
-        path = os.path.join(folder_name, filename)
-        if not os.path.exists(path):
-            try:
-                response = requests.get(url, headers=headers, timeout=10)
-                if response.status_code == 200:
-                    with open(path, 'wb') as f:
-                        f.write(response.content)
-                    print(f"İndirildi: {filename}")
-                else:
-                    print(f"İndirilemedi (Status {response.status_code}): {url}")
-            except Exception as e:
-                print(f"Hata ({url}): {e}")
 
-def load_data(folder_name="resimler"):
-    """Belirtilen klasördeki tüm resimleri okur ve hazırlar."""
-    images = []
-    valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif')
+# ==========================================
+# VERİ YÖNETİCİSİ (DATA MANAGER)
+# ==========================================
+class DataManager:
+    """Veri indirme, yükleme ve işleme süreçlerini yönetir."""
     
-    # Önce indirmeyi/kontrolü yap
-    download_and_save_images(folder_name)
-    
-    print("Resimler yükleniyor...")
-    files = [f for f in os.listdir(folder_name) if f.lower().endswith(valid_extensions)]
-    
-    for filename in files:
-        path = os.path.join(folder_name, filename)
+    def __init__(self, data_dir: str = Config.DATA_DIR):
+        self.data_dir = data_dir
+        self._ensure_data_dir()
+        
+    def _ensure_data_dir(self):
+        if not os.path.exists(self.data_dir):
+            os.makedirs(self.data_dir)
+            
+    def download_defaults(self):
+        """Varsayılan resimleri indirir."""
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        print(f"[INFO] Veri klasörü kontrol ediliyor: {self.data_dir}")
+        
+        for filename, url in Config.DEFAULT_URLS:
+            path = os.path.join(self.data_dir, filename)
+            if not os.path.exists(path):
+                try:
+                    print(f"   İndiriliyor: {filename}...")
+                    response = requests.get(url, headers=headers, timeout=10)
+                    if response.status_code == 200:
+                        with open(path, 'wb') as f:
+                            f.write(response.content)
+                except Exception as e:
+                    print(f"   [HATA] İndirme başarısız ({filename}): {e}")
+
+    def load_dataset(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Eğitim için veri setini hazırlar."""
+        self.download_defaults()
+        
+        valid_exts = ('*.jpg', '*.jpeg', '*.png', '*.bmp')
+        files = []
+        for ext in valid_exts:
+            files.extend(glob.glob(os.path.join(self.data_dir, ext)))
+            
+        if not files:
+            print("[UYARI] Hiç resim bulunamadı! Rastgele gürültü kullanılacak.")
+            return self._generate_noise_data()
+            
+        images = []
+        for f in files:
+            try:
+                img = Image.open(f).convert('RGB')
+                img = img.resize(Config.IMG_SIZE)
+                images.append(np.array(img) / 255.0)
+            except Exception as e:
+                print(f"   [HATA] Resim okunamadı {f}: {e}")
+                
+        if not images:
+            return self._generate_noise_data()
+            
+        # Data Augmentation (Veri Çoğaltma)
+        X = np.array(images * 50) # Veri setini yapay olarak büyüt
+        np.random.shuffle(X)
+        
+        # Split (Yarı yarıya böl)
+        mid = len(X) // 2
+        covers = X[:mid]
+        secrets = X[mid:2*mid]
+        
+        # Boyut eşitleme
+        limit = min(len(covers), len(secrets))
+        return covers[:limit], secrets[:limit]
+
+    def _generate_noise_data(self):
+        shape = (10, *Config.IMG_SIZE, Config.CHANNELS)
+        return np.random.rand(*shape), np.random.rand(*shape)
+
+    @staticmethod
+    def load_single_image(path: str) -> Optional[np.ndarray]:
+        """Tek bir resmi yükler ve normalize eder."""
         try:
             img = Image.open(path).convert('RGB')
-            img = img.resize(IMG_SIZE)
-            img_array = np.array(img) / 255.0
-            images.append(img_array)
-        except Exception as e:
-            print(f"Okunamadı: {filename} - {e}")
+            img = img.resize(Config.IMG_SIZE)
+            return np.array(img) / 255.0
+        except:
+            return None
+
+    @staticmethod
+    def text_to_image(text: str) -> np.ndarray:
+        """Metni resme dönüştürür."""
+        img = Image.new('RGB', Config.IMG_SIZE, color=(0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("arial.ttf", 24)
+        except:
+            font = ImageFont.load_default()
             
-    if not images:
-        print("HATA: Hiçbir resim yüklenemedi! Lütfen 'resimler' klasörüne .jpg veya .png dosyaları koyun.")
-        # Fallback yine de kod çökmesin diye
-        return np.random.rand(10, *IMG_SIZE, 3), np.random.rand(10, *IMG_SIZE, 3)
-
-    # Veri çoğaltma (Data Augmentation)
-    # Elimizdeki az sayıda resmi kopyalayarak veri setini büyütüyoruz
-    X_train = np.array(images * 50) 
-    np.random.shuffle(X_train)
-    
-    # Cover ve Secret olarak ayır
-    split = len(X_train) // 2
-    covers = X_train[:split]
-    secrets = X_train[split:2*split]
-    
-    # Boyut eşitleme
-    min_len = min(len(covers), len(secrets))
-    return covers[:min_len], secrets[:min_len]
-
-# ==========================================
-# 2. MODEL MİMARİSİ (3 AŞAMALI AĞ)
-# ==========================================
-def make_model():
-    """Deep Steganography Modelini Oluşturur."""
-    
-    # --- Girdiler ---
-    input_cover = layers.Input(shape=(*IMG_SIZE, 3), name='input_cover')
-    input_secret = layers.Input(shape=(*IMG_SIZE, 3), name='input_secret')
-    
-    # --- 1. Prep Network (Gizli Resmi Hazırlama) ---
-    # Gizli resmin özelliklerini çıkarır ve saklanmaya uygun hale getirir
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(input_secret)
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(x)
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(x)
-    prep_output = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(x)
-    
-    # --- 2. Hiding Network (Encoder) ---
-    # Kapak resmi ile Prep çıktısını birleştirir
-    concat_input = layers.Concatenate()([input_cover, prep_output])
-    
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(concat_input)
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(x)
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(x)
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(x)
-    
-    # Çıktı: Container Image (3 kanal RGB)
-    # Aktivasyon 'sigmoid' çünkü çıktı 0-1 arasında olmalı (Piksel değerleri)
-    container_output = layers.Conv2D(3, (3, 3), padding='same', activation='sigmoid', name='output_container')(x)
-    
-    # --- 3. Reveal Network (Decoder) ---
-    # Sadece Container resmine bakarak gizli resmi bulmaya çalışır
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(container_output)
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(x)
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(x)
-    x = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(x)
-    
-    # Çıktı: Revealed Secret (3 kanal RGB)
-    reveal_output = layers.Conv2D(3, (3, 3), padding='same', activation='sigmoid', name='output_reveal')(x)
-    
-    # Modeli birleştir
-    model = models.Model(inputs=[input_cover, input_secret], outputs=[container_output, reveal_output])
-    return model
-
-# ==========================================
-# 3. ÖZEL LOSS FONKSİYONU VE DERLEME
-# ==========================================
-def custom_loss(beta=1.0):
-    """
-    Toplam Hata = ||Kapak - Container|| + beta * ||Gizli - OrtayaÇıkan||
-    """
-    def loss_function(y_true, y_pred):
-        # Keras model.compile'da loss dictionary olarak verilecek,
-        # ama genel mantığı burada anlamak önemli.
-        # Biz aşağıda compile ederken standart MSE kullanıp ağırlıklandıracağız.
-        pass
-    return loss_function
-
-# ==========================================
-# 5. ÖZEL TEST VE METİN SAKLAMA MODU
-# ==========================================
-def text_to_image(text):
-    """Metni resme çevirir (Siyah üzerine beyaz yazı)."""
-    img = Image.new('RGB', IMG_SIZE, color=(0, 0, 0))
-    d = ImageDraw.Draw(img)
-    # Font yüklemeye çalış, yoksa varsayılanı kullan
-    try:
-        # Windows varsayılan fontu
-        font = ImageFont.truetype("arial.ttf", 20)
-    except:
-        font = ImageFont.load_default()
-    
-    # Metni yaz (Basitçe sol üst köşeye)
-    d.text((10, 50), text, fill=(255, 255, 255), font=font)
-    return img
-
-def prepare_single_image(image_path):
-    """Tek bir resmi model için hazırlar."""
-    try:
-        img = Image.open(image_path).convert('RGB')
-        img = img.resize(IMG_SIZE)
+        # Metni ortalamaya çalışmadan basitçe yaz
+        draw.text((10, 50), text, fill=(255, 255, 255), font=font)
         return np.array(img) / 255.0
-    except Exception as e:
-        print(f"Hata: {image_path} açılamadı. {e}")
-        return None
 
-def run_custom_test(model):
-    print("\n" + "="*40)
-    print("      ÖZEL TEST MODU (NE SAKLADIK?)")
-    print("="*40)
+# ==========================================
+# MODEL MİMARİSİ (STEGANOGRAPHY NETWORK)
+# ==========================================
+class StegoModel:
+    """Deep Steganography Model Mimarisini Kapsüller."""
     
-    def find_file(names):
-        """Dosyayı ana dizinde veya 'resimler' klasöründe arar."""
-        if isinstance(names, str): names = [names]
-        for name in names:
-            # 1. Ana dizine bak
-            if os.path.exists(name): return name
-            # 2. resimler klasörüne bak
-            path_in_folder = os.path.join("resimler", name)
-            if os.path.exists(path_in_folder): return path_in_folder
-        return None
+    def __init__(self):
+        self.model = self._build_graph()
+        
+    def _build_graph(self) -> models.Model:
+        # Girdiler
+        input_cover = layers.Input(shape=(*Config.IMG_SIZE, Config.CHANNELS), name='cover_input')
+        input_secret = layers.Input(shape=(*Config.IMG_SIZE, Config.CHANNELS), name='secret_input')
+        
+        # --- 1. Prep Network ---
+        # Gizli resmin özelliklerini çıkarır
+        p = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(input_secret)
+        p = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(p)
+        p = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(p)
+        p = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(p)
+        
+        # --- 2. Hiding Network ---
+        # Kapak ve Prep çıktısını birleştirir
+        concat = layers.Concatenate()([input_cover, p])
+        
+        h = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(concat)
+        h = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(h)
+        h = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(h)
+        h = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(h)
+        h = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(h)
+        
+        # Çıktı Katmanı (Container)
+        output_container = layers.Conv2D(3, (3, 3), padding='same', activation='sigmoid', name='output_container')(h)
+        
+        # --- 3. Reveal Network ---
+        # Container'dan gizli resmi çıkarır
+        r = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(output_container)
+        r = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(r)
+        r = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(r)
+        r = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(r)
+        r = layers.Conv2D(50, (3, 3), padding='same', activation='relu')(r)
+        
+        output_reveal = layers.Conv2D(3, (3, 3), padding='same', activation='sigmoid', name='output_reveal')(r)
+        
+        return models.Model(inputs=[input_cover, input_secret], outputs=[output_container, output_reveal])
+    
+    def compile(self):
+        """Modeli özel ağırlıklarla derler."""
+        self.model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=Config.LEARNING_RATE),
+            loss={
+                'output_container': 'mse',
+                'output_reveal': 'mse'
+            },
+            loss_weights={
+                'output_container': Config.LOSS_ALPHA, # Kapak resminin bozulmaması ÇOK önemli
+                'output_reveal': Config.LOSS_BETA      # Gizli resmin çıkması da önemli
+            }
+        )
+        
+    def train(self, covers, secrets):
+        """Eğitim döngüsünü başlatır."""
+        print(f"\n[INFO] Eğitim Başlıyor ({Config.EPOCHS} Epoch)...")
+        print(f"       Alpha (Kapak Koruması): {Config.LOSS_ALPHA}")
+        print(f"       Beta  (Gizli Veri):     {Config.LOSS_BETA}")
+        
+        history = self.model.fit(
+            x=[covers, secrets],
+            y=[covers, secrets],
+            batch_size=Config.BATCH_SIZE,
+            epochs=Config.EPOCHS,
+            verbose=1
+        )
+        return history
 
-    # 1. Kapak Resmi Seçimi
-    # Sırasıyla bu isimlere bakar
-    cover_path = find_file(["kapak.jpg", "kapak.png", "manzara.jpg", "tablo.jpg"])
+    def predict(self, cover, secret):
+        """Tekil tahmin yapar."""
+        # Boyut ekle (Batch dimension): (128,128,3) -> (1,128,128,3)
+        c_in = np.expand_dims(cover, axis=0)
+        s_in = np.expand_dims(secret, axis=0)
+        return self.model.predict([c_in, s_in], verbose=0)
+
+# ==========================================
+# GÖRSELLEŞTİRİCİ (VISUALIZER)
+# ==========================================
+class Visualizer:
+    """Sonuçları görselleştirme ve kaydetme işlemlerini yapar."""
     
+    @staticmethod
+    def save_results(cover, secret, container, revealed, filename="sonuc.png", title_suffix=""):
+        """4'lü sonuç görselini kaydeder."""
+        fig, axes = plt.subplots(1, 4, figsize=(16, 5))
+        
+        items = [
+            ("Orijinal Kapak", cover),
+            (f"Gizli Veri\n{title_suffix}", secret),
+            ("Stego (Konteyner)", container),
+            ("Geri Çıkarılan", revealed)
+        ]
+        
+        for i, (title, img) in enumerate(items):
+            # Görüntüyü kırp (0-1 dışına taşanları düzelt)
+            img = np.clip(img, 0, 1)
+            axes[i].imshow(img)
+            axes[i].set_title(title, fontsize=10, fontweight='bold')
+            axes[i].axis('off')
+            
+        plt.tight_layout()
+        plt.savefig(filename, dpi=150)
+        plt.close()
+        print(f"   [KAYIT] Sonuç kaydedildi: {filename}")
+
+# ==========================================
+# ANA UYGULAMA (MAIN APP)
+# ==========================================
+def find_local_file(names: Union[str, List[str]]) -> Optional[str]:
+    """Dosyayı kök dizinde veya data klasöründe arar."""
+    if isinstance(names, str): names = [names]
+    for name in names:
+        if os.path.exists(name): return name
+        path_in_data = os.path.join(Config.DATA_DIR, name)
+        if os.path.exists(path_in_data): return path_in_data
+    return None
+
+def run_custom_tests(model: StegoModel):
+    """Kullanıcının özel dosyalarıyla test yapar."""
+    print("\n" + "="*50)
+    print("      ÖZEL TEST SENARYOLARI ÇALIŞTIRILIYOR")
+    print("="*50)
+    
+    # 1. Kapak Resmi Bul
+    cover_path = find_local_file(["kapak.jpg", "kapak.png", "manzara.jpg"])
     if not cover_path:
-        print("UYARI: Kapak resmi (kapak.jpg veya resimler/manzara.jpg) bulunamadı.")
+        print("[UYARI] Kapak resmi bulunamadı!")
         return
-
-    # Kapak resmini yükle
-    cover_img = prepare_single_image(cover_path)
+        
+    cover_img = DataManager.load_single_image(cover_path)
     if cover_img is None: return
-    cover_input = np.expand_dims(cover_img, axis=0)
 
-    # 2. Test Senaryolarını Belirle
+    # 2. Senaryoları Belirle
     scenarios = []
     
-    # Senaryo A: Kullanıcı Resmi
-    secret_img_path = find_file(["gizli.jpg", "gizli.png"])
+    # A. Resim Saklama
+    secret_img_path = find_local_file(["gizli.jpg", "gizli.png"])
     if secret_img_path:
         scenarios.append({
-            "type": "image",
-            "path": secret_img_path,
-            "desc": f"Kullanici Resmi ({os.path.basename(secret_img_path)})",
-            "save_name": "ozel_sonuc_resim.png"
+            "type": "img", "data": secret_img_path, 
+            "name": "ozel_sonuc_resim.png", "desc": "Resim Saklama"
         })
         
-    # Senaryo B: Kullanıcı Metni
-    secret_txt_path = find_file("gizli.txt")
+    # B. Metin Saklama
+    secret_txt_path = find_local_file("gizli.txt")
     if secret_txt_path:
         scenarios.append({
-            "type": "text",
-            "path": secret_txt_path,
-            "desc": f"Gizli Metin ({os.path.basename(secret_txt_path)})",
-            "save_name": "ozel_sonuc_metin.png"
+            "type": "txt", "data": secret_txt_path, 
+            "name": "ozel_sonuc_metin.png", "desc": "Metin Saklama"
         })
         
-    # Senaryo C: Hiçbiri yoksa Varsayılan
+    # C. Varsayılan (Eğer hiçbiri yoksa)
     if not scenarios:
-        default_cat = find_file(["kedi.jpg", "resimler/kedi.jpg"])
-        if default_cat:
+        cat_path = find_local_file(["kedi.jpg", "resimler/kedi.jpg"])
+        if cat_path:
             scenarios.append({
-                "type": "image",
-                "path": default_cat,
-                "desc": "Varsayılan Kedi",
-                "save_name": "ozel_sonuc.png"
+                "type": "img", "data": cat_path, 
+                "name": "ozel_sonuc_demo.png", "desc": "Demo (Kedi)"
             })
-        else:
-            print("Gizli saklanacak bir şey (gizli.jpg, gizli.txt veya kedi.jpg) bulunamadı!")
-            return
 
-    # 3. Her Senaryoyu Çalıştır
+    # 3. Çalıştır
     for sc in scenarios:
-        print(f"\n--- İşleniyor: {sc['desc']} ---")
+        print(f"\n--- Senaryo: {sc['desc']} ---")
         
         secret_img = None
-        if sc["type"] == "image":
-            secret_img = prepare_single_image(sc["path"])
-        elif sc["type"] == "text":
+        if sc['type'] == 'img':
+            secret_img = DataManager.load_single_image(sc['data'])
+        elif sc['type'] == 'txt':
             try:
-                with open(sc["path"], 'r', encoding='utf-8') as f:
+                with open(sc['data'], 'r', encoding='utf-8') as f:
                     text = f.read()
-                pil_img = text_to_image(text)
-                secret_img = np.array(pil_img) / 255.0
-            except Exception as e:
-                print(f"Metin okuma hatası: {e}")
+                secret_img = DataManager.text_to_image(text)
+            except:
+                print("   [HATA] Metin dosyası okunamadı.")
                 continue
                 
         if secret_img is None: continue
         
-        secret_input = np.expand_dims(secret_img, axis=0)
-        
         # Tahmin
-        container_pred, reveal_pred = model.predict([cover_input, secret_input])
+        preds = model.predict(cover_img, secret_img)
+        container, revealed = preds[0][0], preds[1][0]
         
-        # Görselleştirme
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-        titles = [f"Kapak: {os.path.basename(cover_path)}", f"Gizli: {sc['desc']}", "Konteyner", "Geri Çıkarılan"]
-        images_show = [cover_img, secret_img, container_pred[0], reveal_pred[0]]
-        
-        for i, ax in enumerate(axes):
-            ax.imshow(images_show[i])
-            ax.set_title(titles[i], fontsize=10)
-            ax.axis('off')
-            
-        plt.savefig(sc["save_name"])
-        plt.close() # Belleği temizle
-        print(f"✅ Sonuç kaydedildi: {sc['save_name']}")
+        # Kaydet
+        Visualizer.save_results(
+            cover_img, secret_img, container, revealed, 
+            filename=sc['name'], title_suffix=f"({sc['desc']})"
+        )
 
-    print("-" * 50)
-    print("TÜM İŞLEMLER TAMAMLANDI!")
-    print("-" * 50)
+def main():
+    # 1. Veri Hazırlığı
+    dm = DataManager()
+    covers, secrets = dm.load_dataset()
+    print(f"[INFO] Veri Seti: {len(covers)} çift resim hazırlandı.")
+    
+    # 2. Model Kurulumu
+    stego = StegoModel()
+    stego.compile()
+    # stego.model.summary() # İstersen açabilirsin
+    
+    # 3. Eğitim
+    stego.train(covers, secrets)
+    
+    # 4. Testler
+    run_custom_tests(stego)
+    
+    print("\n[BAŞARILI] Tüm işlemler tamamlandı.")
 
-# ==========================================
-# 4. ANA ÇALIŞTIRMA BLOĞU
-# ==========================================
 if __name__ == "__main__":
-    # 1. Veriyi Yükle
-    # 'resimler' klasörüne bakacak, yoksa indirip oluşturacak
-    covers, secrets = load_data()
-    
-    # 2. Modeli Oluştur
-    print("Model inşa ediliyor...")
-    stego_model = make_model()
-    # stego_model.summary() # Detaylı tabloyu görmek istersen açabilirsin
-    
-    # 3. Modeli Derle (Compile)
-    # İki çıktımız var: output_container ve output_reveal
-    # İkisi için de Mean Squared Error (MSE) kullanıyoruz.
-    # loss_weights ile beta katsayısını uyguluyoruz.
-    stego_model.compile(
-        optimizer='adam',
-        loss={
-            'output_container': 'mse', 
-            'output_reveal': 'mse'
-        },
-        loss_weights={
-            'output_container': 1.0,  # Kapak resminin bozulmaması ne kadar önemli?
-            'output_reveal': BETA     # Gizli mesajın bulunması ne kadar önemli?
-        }
-    )
-    
-    # 4. Eğitimi Başlat
-    print(f"Eğitim başlıyor ({EPOCHS} Epoch)... Lütfen bekleyin.")
-    history = stego_model.fit(
-        x=[covers, secrets],              # Girdiler
-        y=[covers, secrets],              # Hedefler: Container -> Cover'a benzemeli, Reveal -> Secret'a benzemeli
-        batch_size=BATCH_SIZE,
-        epochs=EPOCHS,
-        verbose=1
-    )
-    
-    print("Eğitim tamamlandı!")
-    
-    # 5. Sonuçları Test Et ve Görselleştir
-    print("Sonuçlar test ediliyor...")
-    
-    # Test için rastgele bir örnek seç
-    idx = np.random.randint(0, len(covers))
-    test_cover = covers[idx:idx+1]
-    test_secret = secrets[idx:idx+1]
-    
-    # Tahmin yap
-    container_pred, reveal_pred = stego_model.predict([test_cover, test_secret])
-    
-    # Görselleştirme
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-    
-    # Başlıklar
-    titles = ["Orijinal Kapak (Cover)", "Gizli Resim (Secret)", "Konteyner (Container)", "Ortaya Çıkan (Revealed)"]
-    images_show = [test_cover[0], test_secret[0], container_pred[0], reveal_pred[0]]
-    
-    for i, ax in enumerate(axes):
-        ax.imshow(images_show[i])
-        ax.set_title(titles[i])
-        ax.axis('off')
-    
-    # Kaydet
-    save_path = "sonuc.png"
-    plt.savefig(save_path)
-    print(f"Sonuç görseli '{save_path}' olarak kaydedildi. Dosyayı açıp bakabilirsin!")
-    
-    # Farkı hesapla (İsteğe bağlı bilgi)
-    diff = np.abs(test_cover[0] - container_pred[0])
-    print(f"Kapak ve Konteyner arasındaki ortalama piksel farkı: {np.mean(diff):.4f} (0-1 arası)")
-
-    # 6. Özel Testi Çalıştır
-    run_custom_test(stego_model)
+    main()
